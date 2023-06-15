@@ -1,0 +1,17 @@
+---
+title: "UFO Models"
+format: html
+---
+
+## Sunrise and sunset
+
+```{r packages}
+library(here)
+library(httr2)
+```
+
+```{r load-data}
+data_ufo_reports_clean <- readRDS(
+  here::here("data", "data_ufo_reports_clean.rds")
+)
+```

@@ -1,0 +1,921 @@
+---
+title: "UFO Data"
+format: html
+---
+
+## Finding the dataset
+
+Packages used in this document:
+
+```{r packages}
+#| message: false
+#| warning: false
+library(conflicted)
+library(countrycode)
+library(fs)
+library(here)
+library(janitor)
+library(piecemaker)
+library(rvest)
+library(tidyverse)
+conflicted::conflict_prefer("filter", "dplyr")
+library(ttmeta)
+```
+
+I wanted a dataset that has time and location (latitude and longitude).
+I used the {ttmeta} package to find such a dataset.
+
+```{r ttmeta}
+potential_datasets <- tt_datasets_metadata |>
+  filter(lengths(variable_details) > 0) |> 
+  mutate(
+    has_latitude = map_lgl(
+      variable_details,
+      \(x) {
+        any(str_detect(x$variable, "latitude"))
+      }
+    ),
+    has_longitude = map_lgl(
+      variable_details,
+      \(x) {
+        any(str_detect(x$variable, "longitude"))
+      }
+    ),
+    has_time = map_lgl(
+      variable_details,
+      \(x) {
+        any(str_detect(x$variable, "time"))
+      }
+    )
+  ) |> 
+  filter(has_latitude, has_longitude, has_time) |> 
+  left_join(tt_summary_tbl, by = c("year", "week")) |> 
+  select(year, date, dataset_name, variables, observations, variable_details) |>
+  mutate(
+    url = glue::glue("https://tidytues.day/{year}/{date}")
+  )
+
+potential_datasets
+```
+
+I decided to try using the `ufo_sightings` dataset from [Tidy Tuesday 2019-06-25](https://tidytues.day/2019/2019-06-25).
+I needed to clean it anyway, so I updated it while I was at it.
+This also serves as an example of using {rvest}!
+
+## Refreshing the dataset
+
+The data came from the [National UFO Reporting Center](https://nuforc.org/).
+The easiest page to scrape appeared to be the [UFO Report Index by Shape of Craft](https://nuforc.org/webreports/ndxshape.html).
+
+I used the [SelectorGadget](https://rvest.tidyverse.org/articles/selectorgadget.html) to find the HTML elements that I cared about.
+
+```{r scrape, eval = FALSE}
+url_report_index <- "https://nuforc.org/webreports/ndxshape.html"
+html_report_index <- rvest::read_html(url_report_index)
+
+# Grab the index data to use for validation of the scrape.
+data_report_index <- html_report_index |> 
+  rvest::html_table() |> 
+  _[[1]]
+
+# Scrape the report pages.
+report_dir <- here::here("data", "ufos")
+url_reports_all <- html_report_index |>
+  rvest::html_elements("td a") |>
+  rvest::html_attr("href") |>
+  rvest::url_absolute(url_report_index)
+url_reports_all |>
+  purrr::walk(
+    \(url_report) {
+      report_name <- paste0(
+        stringr::str_extract(url_report, "[^/.]+(?=\\.html$)"),
+        ".rds"
+      )
+
+      rvest::read_html(url_report) |>
+        rvest::html_element("table") |>
+        rvest::html_table(na.strings = c("NA", "")) |>
+        saveRDS(fs::path(report_dir, report_name))
+    }
+  )
+
+data_ufo_reports <- fs::dir_map(report_dir, readRDS)
+
+# 3 tables loaded strangely. Manual checks found that the (many) extra columns
+# didn't contain any information, and were caused by weird HTML in one
+# particular cell of each table. I'm preserving a sample of the code that I used
+# to find the issues.
+colcheck <- purrr::map(data_ufo_reports, ncol)
+which(colcheck != 9)
+
+has_non_na <- data_ufo_reports[[18]][, 10:ncol(data_ufo_reports[[18]])] |> 
+  purrr::map_lgl(
+    ~ any(!is.na(.x))
+  )
+
+non_na_rows <- data_ufo_reports[[18]][, 10:ncol(data_ufo_reports[[18]])][, has_non_na] |> 
+  purrr::map(
+    ~ which(!is.na(.x))
+  ) |> 
+  unlist() |> 
+  unique() |> 
+  sort()
+
+length(non_na_rows)
+
+data_ufo_reports[[12]] <- data_ufo_reports[[12]][, 1:9]
+data_ufo_reports[[14]] <- data_ufo_reports[[14]][, 1:9]
+data_ufo_reports[[18]] <- data_ufo_reports[[18]][, 1:9]
+data_ufo_reports[[18]][non_na_rows, ]$Duration <- NA
+
+colcheck <- purrr::map(data_ufo_reports, colnames)
+which(lengths(colcheck) != 9)
+
+data_ufo_reports <- purrr::list_rbind(data_ufo_reports) |> 
+  janitor::clean_names()
+
+saveRDS(data_ufo_reports, here::here("data", "data_ufo_reports.rds"))
+```
+
+```{r load-data}
+data_ufo_reports <- readRDS(here::here("data", "data_ufo_reports.rds"))
+n_ufo_reports_original <- nrow(data_ufo_reports)
+```
+
+The original clean data did two things for us that we needed to restore:
+
+1.  "Standardized" the date_time column (but we can do better!)
+2.  Parsed the location into coordinates (which is the whole reason we wanted this dataset!)
+
+## Geocoding the data
+
+At first I was trying to use an API to geocode the data, but this revealed a problem to watch out for: if an API doesn't have a batch mode, it can be extremely slow!
+I stumbled on the [GeoNames](https://www.geonames.org/) project, which allowed me to download a TSV with about 200k cities.
+Bonus: We get some features for free!
+
+```{r download-geonames, eval = FALSE}
+download.file(
+  "http://download.geonames.org/export/dump/cities500.zip",
+  here::here("data", "cities500.zip")
+)
+download.file(
+  "http://download.geonames.org/export/dump/admin1CodesASCII.txt",
+  here::here("data", "admin1CodesASCII.txt")
+)
+```
+
+```{r geonames}
+# The UFO dataset has 2-letter codes for Canadian provinces, geocodes has full
+# names.
+canada_codes <- dplyr::tribble(
+  ~"province", ~"ca_code",
+  "Alberta", "AB",
+  "British Columbia", "BC",
+  "Manitoba", "MB",
+  "New Brunswick", "NB",
+  "Newfoundland and Labrador", "NL",
+  "Northwest Territories", "NT",
+  "Nova Scotia", "NS",
+  "Nunavut", "NU",
+  "Ontario", "ON",
+  "Prince Edward Island", "PE",
+  "Quebec", "QC",
+  "Saskatchewan", "SK",
+  "Yukon", "YT"
+) |> 
+  dplyr::mutate(country_code = "CA")
+
+# Translate the admin1_codes.
+admin1_codes_translation <- readr::read_tsv(
+  here::here("data", "admin1CodesASCII.txt"),
+  col_names = c(
+    "country.admin",
+    "name",
+    "ascii_state",
+    "other"
+  )
+) |> 
+  dplyr::select(country.admin, ascii_state) |> 
+  tidyr::separate_wider_delim(
+    country.admin,
+    ".",
+    names = c("country_code", "admin1_code")
+  ) |> 
+  # Only translate the numeric ones.
+  dplyr::filter(
+    !(country_code %in% c("US", "GB"))
+  ) |> 
+  dplyr::left_join(
+    canada_codes,
+    by = dplyr::join_by(
+      country_code,
+      ascii_state == province
+    )
+  ) |> 
+  dplyr::mutate(
+    ascii_state = dplyr::coalesce(ca_code, ascii_state)
+  ) |> 
+  dplyr::select(-"ca_code")
+
+city_geocodes <- readr::read_tsv(
+  here::here("data", "cities500.zip"),
+  col_names = c(
+    "geonameid",
+    "name",
+    "asciiname",
+    "alternatenames",
+    "latitude",
+    "longitude",
+    "feature class",
+    "feature code",
+    "country code",
+    "cc2",
+    "admin1 code",
+    "admin2 code",
+    "admin3 code",
+    "admin4 code",
+    "population",
+    "elevation",
+    "dem",
+    "timezone",
+    "modification date"
+  )
+) |> 
+  janitor::clean_names() |> 
+  dplyr::left_join(
+    admin1_codes_translation, by = dplyr::join_by(country_code, admin1_code)
+  ) |> 
+  dplyr::mutate(
+    ascii_state = dplyr::coalesce(ascii_state, admin1_code),
+    # NA out countries with bad codes.
+    ascii_state = dplyr::if_else(
+      country_code %in% c("IE") | (country_code == "GB" & ascii_state == "05"),
+      NA,
+      ascii_state
+    )
+  ) |> 
+  dplyr::select(
+    name, ascii_name = asciiname, alternate_city_names = alternatenames,
+    country_code,
+    ascii_state,
+    latitude, longitude,
+    timezone,
+    population,
+    elevation
+  ) |> 
+  # Some rows have the same name, country_code, and ascii_state. For
+  # those, only keep the most populous.
+  dplyr::arrange(name, country_code, ascii_state, population) |> 
+  dplyr::distinct(ascii_name, country_code, ascii_state, .keep_all = TRUE)
+```
+
+Next I iteratively found and fixed weird place names.
+These are necessarily discovered rather manually by iterating over these steps shown.
+I really only care about rows that might match to `city_geocodes`, but I'll likely end up "fixing" some others along the way that later get filtered out.
+
+```{r geocoding-prep}
+# Fix place names with errors. These necessarilly are discoverd somewhat
+# manually by iterating over the steps below.
+data_ufo_reports_join <- data_ufo_reports |> 
+  dplyr::mutate(
+    city = stringr::str_squish(city),
+    state = stringr::str_squish(state),
+    country = stringr::str_squish(country),
+    city = dplyr::case_match(
+      city,
+      "London (UK/England)" ~ "London",
+      "Dahab (Sinai)" ~ "Dahab",
+      "Novi Sad, Kac (Yugoslavia)" ~ "Novi Sad",
+      "Split (in former Yugoslavia)" ~ "Split",
+      "Mitrovica (Kosovo, Yugoslavia)" ~ "Mitrovica",
+      "Angra (Portuguese Azores)" ~ "Angra do Heroismo",
+      "Budakeszi (Budapest)(Hungary)" ~ "Budakeszi",
+      "Milan (at sea on S.S. Giovanni)" ~ "Milan",
+      "Belfast (near)(Northern Ireland)" ~ "Belfast",
+      "Cebu (Philippines)" ~ "Cebu",
+      "Adelaide (Australia)" ~ "Adelaide",
+      "Al Jizah (Egypt)" ~ "Al Jizah",
+      "Above Port Blair" ~ "Port Blair",
+      "Santa Bonifacio (Corsica)" ~ "Bonifacio",
+      "St. Maarten (Netherland Antilles))" ~ NA,
+      .default = city
+    ),
+    # city = stringr::str_remove(city, " \\(Yugoslavia\\)$"),
+    city = stringr::str_remove_all(city, "\\([^)]+\\)") |> 
+      stringr::str_squish(),
+    city = dplyr::case_when(
+      stringr::str_detect(city, "Tenerife") ~ "Santa Cruz de Tenerife",
+      .default = city
+    ),
+    state = dplyr::case_when(
+      country == "Portereco 2 miles of the coast" ~ "PR",
+      country == "Puerto Rico" ~ "PR",
+      .default = state
+    ),
+    country = dplyr::case_match(
+      country,
+      "Swizterland" ~ "Switzerland",
+      c(
+        "UK/England", "England", "North Wales", "Northern Ireland", "London",
+        "Scotland"
+      ) ~ "United Kingdom",
+      "Norge" ~ "Norway",
+      "Roma" ~ "Italy", 
+      "Murcia" ~ "Spain",
+      "Slovakia/Austria" ~ "Slovakia",
+      "Srui Lanka" ~ "Sri Lanka",
+      "Netherland Antilles" ~ "Sint Maarten",
+      "Thailand & Malaysia" ~ "Thailand",
+      "Sinai" ~ "Egypt",
+      "Azores" ~ "Portugal",
+      "Tenerife" ~ "Spain",
+      "Nederland" ~ "Netherlands",
+      "Dubai" ~ "United Arab Emirates",
+      "Guatamala" ~ "Guatemala",
+      "Okinawa" ~ "Japan",
+      "Virgin Islands" ~ "U.S. Virgin Islands",
+      "Andaman Islands" ~ "India",
+      "Bahamas/USA" ~ "Bahamas",
+      "Euleuthera" ~ "Bahamas",
+      "Caicos Islands" ~ "Turks & Caicos Islands",
+      "Caribbean (Grand Turk)" ~ "Turks & Caicos Islands",
+      "Channel Islands" ~ "Guernsey",
+      "Chennai. Tamil Nadu" ~ "India",
+      "Citizen" ~ "USA",
+      "Puerto Rico" ~ "USA",
+      "Colorado springs" ~ "USA",
+      "Corsica" ~ "France",
+      "Decalb" ~ "USA",
+      "El Cobre" ~ "Venezuela",
+      c(
+        "Atlantic Ocean", "Caribbean", "Caribbean Sea", 
+        "Caribbean Sea/Atantic Ocean", "Europe", "In orbit", 
+        "Indian Ocean", "Mediterranean Sea", "Moon", "Pacific Ocean", 
+        "Pacific Ocean (western)", "Above the pacific ocean", "Aegean Sea",
+        "Portereco 2 miles of the coast", "unknown/at sea", "USA & Canada",
+        "Cruise ship", "East Atlantic Ocean", "Far East", "Foreign"
+      ) ~ NA,
+      .default = country
+    ),
+    country = dplyr::case_when(
+      city %in% c(
+        "Belgrade", "Beograd", "Indjifa", "Kac", "Nis", "Novi Sad", 
+        "Odzaci", "Vrsac", "Zrenjanin"
+      ) & country == "Yugoslavia" ~ "Serbia",
+      city %in% c("Cacak (Serbia/Montenegro)", "Krusevac (Serbia)") & country == "Serbia and Montenegro" ~ "Serbia",
+      city %in% c("Split") & country == "Yugoslavia" ~ "Croatia",
+      city %in% c("Mitrovica") & country == "Yugoslavia" ~ "Kosovo",
+      city == "Budakeszi" & is.na(country) ~ "Hungary",
+      city == "Milan" & is.na(country) ~ "Italy",
+      city == "Belfast" & country == "Yes" ~ "United Kingdom",
+      city == "Cebu" & country == "yes" ~ "Philippines",
+      city == "Adelaide" & country == "yes" ~ "Australia",
+      city == "Al Jizah" & country == "Yes" ~ "Egypt",
+      .default = country
+    )
+  )
+
+country_code_translation <- data_ufo_reports_join |> 
+  dplyr::distinct(country) |> 
+  dplyr::filter(!is.na(country)) |> 
+  dplyr::mutate(
+    country_code = countrycode::countrycode(
+      stringr::str_squish(country),
+      origin = "country.name",
+      destination = "iso2c",
+      warn = FALSE
+    ),
+    country_code = dplyr::case_match(
+      country,
+      "Kosovo" ~ "XK",
+      .default = country_code
+    )
+  )
+
+data_ufo_reports_join |> 
+  dplyr::left_join(country_code_translation) |> 
+  dplyr::count(is.na(country_code))
+
+data_ufo_reports_codes <- data_ufo_reports_join |> 
+  dplyr::left_join(
+    country_code_translation, by = dplyr::join_by(country)
+  ) |> 
+  dplyr::filter(
+    !is.na(country), !is.na(city)
+  )
+
+# data_ufo_reports |> 
+#   dplyr::left_join(country_code_translation) |> 
+#   dplyr::filter(is.na(country_code), !is.na(country)) |> 
+#   dplyr::count(country, sort = TRUE) |> 
+#   dplyr::filter(!stringr::str_detect(tolower(country), "in orbit")) |> 
+#   print(n = 100)
+  
+# data_ufo_reports |> 
+#   dplyr::filter(country == "Foreign") |> 
+#   dplyr::distinct(city)
+```
+
+I gave up with `r n_ufo_reports_original - nrow(data_ufo_reports)` rows left in the "can't identify country code" list.
+We'll filter those out, and attempt to geocode!
+Again, this will be an iterative process, as we remove useless information and correct city name spelling.
+
+```{r geocode}
+# Further corrections to match city_geocodes.
+data_ufo_reports_geocode_prep <- data_ufo_reports_codes |> 
+  dplyr::filter(
+    !(city %in% c("UK/England"))
+  ) |> 
+  dplyr::mutate(
+    state = dplyr::case_when(
+      city == "Washington, D.C." ~ "DC",
+      country_code == "AU" & state == "NT" ~ "Northern Territory",
+      country_code == "AU" & state == "OH" ~ "South Australia",
+      country_code == "AU" & state == "SA" ~ "South Australia",
+      country_code == "AU" & state == "VI" ~ "Victoria",
+      country_code == "AU" & state == "WA" ~ "Western Australia",
+      country_code == "AU" & city == "Perth" ~ "Western Australia",
+      country_code == "CA" & state == "Quebec" ~ "QC",
+      country_code == "CA" & state == "PQ" ~ "QC",
+      country_code == "CA" & state == "SA" ~ "SK",
+      country_code == "CA" & state == "NF" ~ "NL",
+      country_code == "CA" & state == "Alberta" ~ "AB",
+      country_code == "CA" & state == "British Columbia" ~ "BC",
+      country_code == "CA" & state == "Ontario" ~ "ON",
+      country_code == "CA" & state == "Ontario (Canada)a" ~ "ON",
+      country_code == "IN" & state == "Andaman and Nicobar Islands" ~ "Andaman and Nicobar",
+      country_code == "IN" & state == "IN" ~ NA,
+      country_code == "IN" & state == "NT" ~ NA,
+      country_code == "GB" & city == "London" ~ "ENG",
+      country_code == "GB" & state == "England" ~ "ENG",
+      country_code == "GB" & state == "Scotland" ~ "SCT",
+      country_code == "GB" & state == "Wales" ~ "WLS",
+      country_code == "GB" & !(state %in% c("ENG", "SCT", "WLS")) ~ NA,
+      country_code == "MX" & state == "Yucatán" ~ "Yucatan",
+      !(country_code %in% c("US", "CA", "GB", "IN", "MX")) ~ NA,
+      .default = state
+    ),
+    city = dplyr::case_when(
+      city == "Washington, D.C." ~ "Washington",
+      city == "Port St. Lucie" ~ "Port Saint Lucie",
+      city == "St. Paul" & state == "MN" ~ "Saint Paul",
+      city == "St. George" & state == "UT" ~ "Saint George",
+      city == "St. Charles" & state == "MO" ~ "Saint Charles",
+      city == "New York" & state == "NY" ~ "New York City",
+      city == "Reseda" & state == "CA" ~ "Los Angeles",
+      city == "Wilmington" & state == "CA" ~ "Los Angeles",
+      city == "Brick" & state == "NJ" ~ "Lakewood",
+      city == "Midlothian" & state == "VA" ~ "Richmond",
+      city == "Ft. Lauderdale" & state == "FL" ~ "Fort Lauderdale",
+      city == "Land O'Lakes" & state == "FL" ~ "Land O' Lakes",
+      city == "Southington" & state == "CT" ~ "Hartford",
+      city == "St. Peters" & country_code == "US" ~ "Saint Peters",
+      city == "St. Cloud" & country_code == "US" ~ "Saint Cloud",
+      city == "Sedro Woolley" & state == "WA" ~ "Sedro-Woolley",
+      city == "Scarborough" & country_code == "CA" & state == "ON" ~ "Toronto",
+      city == "Whitby" & country_code == "CA" & state == "ON" ~ "Oshawa",
+      city == "Sudbury" & country_code == "CA" & state == "ON" ~ "Greater Sudbury",
+      city == "Bangalore" & country_code == "IN" ~ "Bengaluru",
+      .default = city
+    ),
+    city = stringr::str_replace(
+      city, stringr::fixed("Mt."), "Mount"
+    ),
+    city = stringr::str_replace(
+      city, stringr::fixed("St. Augustine"), "Saint Augustine"
+    )
+  )
+
+city_geocodes_prep <- city_geocodes |> 
+  dplyr::mutate(
+    ascii_name = tolower(ascii_name),
+    state_join = tolower(ascii_state)
+  )
+
+data_ufo_reports_geocoded <- data_ufo_reports_geocode_prep |> 
+  # Give the data_ufo_reports an ID so we can make sure we end up with at most
+  # one of each.
+  dplyr::mutate(id = dplyr::row_number(), .before = date_time) |>
+  dplyr::mutate(
+    city_join = piecemaker::remove_diacritics(tolower(city)),
+    state_join = piecemaker::remove_diacritics(tolower(state)),
+  ) |> 
+  # Get rid of any that don't join.
+  dplyr::inner_join(
+    city_geocodes_prep,
+    by = dplyr::join_by(
+      city_join == ascii_name,
+      country_code == country_code
+    ),
+    relationship = "many-to-many"
+  ) |> 
+  # Either the "state" needs to match, or it needs to be unambiguous.
+  dplyr::filter(
+    state_join.x == state_join.y |
+      (n() == 1 & is.na(state)) |
+      (n() == 1 & is.na(ascii_state)),
+    .by = "id"
+  ) |> 
+  dplyr::select(-"city_join", -"name", -"state_join.x", -"state_join.y")
+
+# This leads to the discovery of some common mismatches, which we use to
+# "repair" the data and try again.
+failures <- data_ufo_reports_geocode_prep |> 
+  dplyr::anti_join(data_ufo_reports_geocoded) |> 
+  dplyr::count(city, state, country_code, sort = TRUE) |> 
+  dplyr::mutate(city = tolower(piecemaker::remove_diacritics(city)))
+
+city_geocodes_prep |> 
+  dplyr::inner_join(
+    failures,
+    by = dplyr::join_by(
+      ascii_name == city,
+      country_code == country_code
+    ),
+    relationship = "many-to-many"
+  ) |> 
+  dplyr::distinct(name, country_code, ascii_state, state, n) |> 
+  dplyr::arrange(dplyr::desc(n)) |> 
+  # dplyr::filter(country_code == "MX", !is.na(state)) |> 
+  # dplyr::distinct(admin1_code, state) |> 
+  # dplyr::slice(11) |> 
+  # dplyr::pull(state)
+  # dplyr::filter(country_code != "US", !is.na(state)) #|>
+  dplyr::count(country_code, wt = n, sort = TRUE)
+  # dplyr::filter(country_code == "NZ")
+
+# Make sure we don't end up with more than one row per id.
+data_ufo_reports_geocoded |> 
+  dplyr::count(id) |> 
+  dplyr::filter(n > 1)
+
+# Since there aren't any, get rid of that field.
+data_ufo_reports_geocoded$id <- NULL
+
+n_geocoded <- nrow(data_ufo_reports_geocoded)
+```
+
+We end up with `r n_geocoded` rows of data out of our original `r n_ufo_reports_original`.
+Good enough!
+
+## Dates and times
+
+Each report has a `date_time` field (when the sighting occurred, *in the local timezone*), and a `posted` field (when the data was collected on the website).
+These fields use two-digit years, so we need to be careful when encoding them into universal date-times.
+
+```{r date-times}
+# 1433 rows don't have a standard detectable date_time. Drop those ones.
+data_ufo_reports_datetime_prep <- data_ufo_reports_geocoded |> 
+  dplyr::filter(
+    stringr::str_detect(date_time, "^\\d{1,2}/\\d{1,2}/\\d{2} \\d{1,2}:\\d{2}$"),
+    stringr::str_detect(posted, "^\\d{1,2}/\\d{1,2}/\\d{2}$")
+  )
+
+# For the remaining rows, encode the date_time
+data_ufo_reports_datetimes <- data_ufo_reports_datetime_prep |> 
+  dplyr::rename(
+    "reported_date_time" = "date_time",
+    "posted_date" = "posted"
+  ) |> 
+  tidyr::separate_wider_regex(
+    reported_date_time,
+    patterns = c(
+      reported_month = "^\\d{1,2}",
+      "/",
+      reported_day = "\\d{1,2}",
+      "/",
+      reported_year = "\\d{2}",
+      " ",
+      reported_hour = "\\d{1,2}",
+      ":",
+      reported_minute = "\\d{2}$"
+    ),
+    cols_remove = FALSE
+  ) |> 
+  dplyr::mutate(
+    reported_year = dplyr::if_else(
+      reported_year <= 23,
+      as.integer(reported_year) + 2000L,
+      as.integer(reported_year) + 1900L
+    )
+  ) |> 
+  dplyr::mutate(
+    reported_date_time = lubridate::make_datetime(
+      year = as.integer(reported_year),
+      month = as.integer(reported_month),
+      day = as.integer(reported_day),
+      hour = as.integer(reported_hour),
+      min = as.integer(reported_minute),
+      tz = timezone
+    ),
+    .by = timezone,
+    .keep = "unused"
+  ) |> 
+  dplyr::mutate(
+    reported_date_time_utc = lubridate::with_tz(reported_date_time, "UTC"),
+    .after = reported_date_time
+  ) |> 
+  # Repeat for posted_date.
+  tidyr::separate_wider_regex(
+    posted_date,
+    patterns = c(
+      posted_month = "^\\d{1,2}",
+      "/",
+      posted_day = "\\d{1,2}",
+      "/",
+      posted_year = "\\d{2}$"
+    ),
+    cols_remove = FALSE
+  ) |> 
+  dplyr::mutate(
+    posted_year = dplyr::if_else(
+      posted_year <= 23,
+      as.integer(posted_year) + 2000L,
+      as.integer(posted_year) + 1900L
+    )
+  ) |> 
+  dplyr::mutate(
+    posted_date = lubridate::make_date(
+      year = as.integer(posted_year),
+      month = as.integer(posted_month),
+      day = as.integer(posted_day)
+    ),
+    .keep = "unused"
+  )
+```
+
+## Durations
+
+In the original dataset used in TidyTuesday, the durations were parsed into seconds.
+I explored doing the same, starting with frequently observed durations.
+
+```{r duration}
+data_ufo_reports_datetimes |> 
+  dplyr::count(duration, sort = TRUE) |> 
+  dplyr::filter(!is.na(duration))
+
+reg_minutes <- "m(in)?(ute)?(s)?(\\.)?"
+reg_seconds <- "s(ec)?(ond)?(s)?(\\.)?"
+reg_hours <- "h(ou)?(r)?(s)?(\\.)?"
+reg_days <- "d(ay)?(s)?(\\.)?"
+reg_num <- "\\d+(\\.(\\d+)?)?"
+
+data_ufo_durations <- data_ufo_reports_datetimes |> 
+  dplyr::mutate(duration = tolower(duration)) |> 
+  dplyr::count(duration, sort = TRUE) |> 
+  dplyr::filter(!is.na(duration)) |> 
+  dplyr::rename(reported_duration = duration) |> 
+  dplyr::mutate(duration_for_parsing = reported_duration) |> 
+  dplyr::mutate(
+    # Substitute in some common number words.
+    duration_for_parsing = stringr::str_replace_all(
+      duration_for_parsing, "(\\d+)\\+(\\d+)", "\\1-\\2"
+    ) |> 
+      stringr::str_remove_all("^about ") |> 
+      stringr::str_remove_all("^roughly ") |> 
+      stringr::str_remove_all("^maybe ") |> 
+      stringr::str_remove_all("^at least ") |> 
+      stringr::str_remove_all("^only ") |> 
+      stringr::str_remove_all(" or more") |> 
+      stringr::str_remove(" max$") |> 
+      stringr::str_remove_all("^\\(?ap+rox(\\.|:|(imately))?\\)? ") |> 
+      stringr::str_replace_all(
+        c(
+          "mintue" = "minute",
+          "minuet" = "minute",
+          "miute" = "minute",
+          "minuite" = "minute",
+          "miniute" = "minute",
+          "minite" = "minute",
+          "minuts" = "minutes",
+          "minutess" = "minutes",
+          "minues" = "minutes",
+          "secound" = "second",
+          "seccond" = "second",
+          "secend" = "second",
+          "secod" = "second",
+          "&" = "and",
+          "^i minute" = "1 minute",
+          " and ((a|one) )*half" = ".5",
+          "(\\d+) 1/2" = "\\1.5",
+          "one half" = "half",
+          "^a half" = "0.5",
+          "^half a(n)?(d)?" = "0.5",
+          "^a quarter" = "0.25",
+          "^a few" = "3",
+          "1/2 " = "0.5",
+          "1/4 " = "0.25",
+          "3/4 " = "0.75",
+          "2/3 " = "0.7",
+          "half " = "0.5",
+          "0.5an" = "0.5",
+          "one or more" = "2",
+          "one or two" = "2",
+          "over one" = "2",
+          "over an" = "2",
+          "over 1" = "2",
+          "one\\s*\\+" = "2",
+          "less th(a|e)n one" = "0.5",
+          "less th(a|e)n 1" = "0.5",
+          "less th(a|e)n a" = "0.5",
+          "about a(n*)" = "1",
+          ":30" = ".5",
+          "(^|[^a-z])one" = "\\11",
+          "(^|[^a-z])two" = "\\12",
+          "(a )?couple( of)?" = "2",
+          "(^|[^a-z])three" = "\\13",
+          "(^|[^a-z])four" = "\\14",
+          "(^|[^a-z])five" = "\\15",
+          "several" = "5",
+          "(^|[^a-z])six" = "\\16",
+          "(^|[^a-z])seven" = "\\17",
+          "(^|[^a-z])eight" = "\\18",
+          "(^|[^a-z])nine" = "\\19",
+          "(^|[^a-z])ten" = "\\110",
+          "fifteen" = "15",
+          "twenty" = "20",
+          "thirty" = "30",
+          " to a(n)? " = " to 1 ",
+          " to " = "-",
+          "\\s*-\\s*" = "-",
+          "or so" = "",
+          " or " = "-",
+          "~" = "",
+          "\\+/?-" = ""
+        )
+      ) |> 
+      stringr::str_replace_all(
+        "^(just )?(a )?few ", "3 "
+      ) |> 
+      stringr::str_replace_all(
+        "<\\s*1([^0-9])(\\s*)", "0.5 \\1"
+      ) |> 
+      stringr::str_replace_all(
+        ">\\s*1([^0-9])(\\s*)", "2 \\1"
+      ) |> 
+      stringr::str_remove_all("^less than ") |> 
+      stringr::str_remove_all("^more than ") |> 
+      stringr::str_remove_all("^over ") |> 
+      stringr::str_remove_all("^under ") |> 
+      stringr::str_remove_all("^around ") |> 
+      stringr::str_replace("^a(n*) ([a-z]+)-2", "2 \\1") |> 
+      stringr::str_replace("^a(n*) ", "1 ") |> 
+      stringr::str_remove_all("\\+") |> 
+      stringr::str_remove_all(" plus") |> 
+      stringr::str_remove_all("<|>") |> 
+      stringr::str_remove_all(":00") |> 
+      stringr::str_remove_all("\\(?\\?+\\)?$") |> 
+      stringr::str_remove("-less$") |> 
+      stringr::str_remove(" at least$") |> 
+      stringr::str_remove(" total$") |> 
+      stringr::str_remove("'s$") |> 
+      stringr::str_remove_all(" \\(?ap+rox(\\.)?(imate)?(ly)?\\)?$") |> 
+      stringr::str_replace("^\\.", "0\\.") |> 
+      stringr::str_replace("^(\\d+)-([a-z]+)$", "\\1 \\2") |> 
+      stringr::str_replace("^([a-z]+).5$", "1.5 \\1") |> 
+      stringr::str_replace("^many", "5") |> 
+      stringr::str_squish(),
+    duration_seconds = dplyr::case_when(
+      # SECONDS
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}\\s*{reg_seconds}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, reg_num)),
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}-{reg_num}\\s*{reg_seconds}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, glue::glue("^{reg_num}-({reg_num})"), 3)),
+      # MINUTES
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}\\s*{reg_minutes}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, reg_num)) *60,
+      stringr::str_detect(
+        duration_for_parsing, 
+        glue::glue("^{reg_num}-{reg_num}\\s*{reg_minutes}$")
+      ) ~ as.double(stringr::str_extract(
+        duration_for_parsing, glue::glue("^{reg_num}-({reg_num})"), 3)) *60,
+      stringr::str_detect(
+        duration_for_parsing, 
+        glue::glue("^{reg_num}\\s*{reg_seconds}-{reg_num}\\s*{reg_minutes}$")
+      ) ~ as.double(stringr::str_extract(
+        duration_for_parsing, glue::glue("^{reg_num}\\s*{reg_seconds}-({reg_num})"), 7)) *60,
+      # HOURS
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}\\s*{reg_hours}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, reg_num)) *60*60*24,
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}-{reg_num}\\s*{reg_hours}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, glue::glue("^{reg_num}-({reg_num})"), 3)) *60*60,
+      # DAYS
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}\\s*{reg_days}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, reg_num)) *60*60*24,
+      stringr::str_detect(
+        duration_for_parsing, glue::glue("^{reg_num}-{reg_num}\\s*{reg_days}$")
+      ) ~ as.double(stringr::str_extract(duration_for_parsing, glue::glue("^{reg_num}-({reg_num})"), 2)) *60*60*24,
+      # OTHERS
+      stringr::str_detect(duration_for_parsing, "split second") ~ 0.5,
+      duration_for_parsing %in% c(
+        "instantaneous", "millisecond", "milliseconds", "very fast"
+      ) ~ 0.5,
+      duration_for_parsing %in% c("second", "instant", "flash") ~ 1L,
+      duration_for_parsing %in% c(
+        "seconds", "brief", "very brief", "short", "very short", "fast", 
+        "quick", "matter of seconds"
+      ) ~ 10L,
+      duration_for_parsing == "few minutes" ~ 3L * 60L,
+      duration_for_parsing == "<1 minute" ~ 30L,
+      duration_for_parsing == "hour" ~ 1L * 60L * 60L,
+      duration_for_parsing == "hours" ~ 5L * 60L * 60L,
+      duration_for_parsing == "minute" ~ 1L * 60L,
+      duration_for_parsing %in% c("minutes", "moments", "momentary", "moment") ~ 5L * 60L,
+      duration_for_parsing %in% c("all night", "night", "all day", "most of the night", "until sunrise", "all morning") ~ 6L * 60L * 60L,
+      # Grab some known weird ones to get them out of the way for now.
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*know[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*unk[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*vari[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*sure[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*certain[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*contin[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*going[a-z]*") ~ 99999,
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*still[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^[a-z' ]*current[a-z]*") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^\\d+ night(s)?") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^\\d+ day(s)?") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^\\d+ week(s)?") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^\\d+ month(s)?") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "^\\d+ year(s)?") ~ 99999, 
+      stringr::str_detect(duration_for_parsing, "long time") ~ 99999, 
+      duration_for_parsing %in% c(
+        "", "none", "n/a", "na", "long", "1 while", "idk"
+      ) ~ 99999,
+      duration_for_parsing %in% c(
+        "nightly", "every night", "morning", "evening", "night time", "days", 
+        "weeks", "afternoon", "months", "intermittent", "steady"
+      ) ~ 99999,
+      duration_for_parsing %in% c(
+        "constant", "now", "present", "all the time", "on-going", "everyday",
+        "non stop"
+      ) ~ 99999,
+      duration_for_parsing %in% c(
+        "photo", "ufo", "picture", "home", "east", "lights", "west", "north", 
+        "south", "sky", "ufo sighting", "driving", "driving home", "pm", 
+        "sighting", "drive by", "in the sky", "snapshot", "bright light",
+        "hovering", "light", "my house", "stationary", "walking"
+      ) ~ 99999,
+      !stringr::str_detect(duration_for_parsing, "[a-z]") ~ 99999,
+      .default = NA
+    )
+  ) |>
+  dplyr::filter(
+    !is.na(duration_seconds),
+    duration_seconds != 99999
+  ) |> 
+  dplyr::select(-"duration_for_parsing", -"n")
+
+data_ufo_reports_durations <- data_ufo_reports_datetimes |> 
+  dplyr::rename("reported_duration" = "duration") |> 
+  dplyr::inner_join(data_ufo_durations, by = "reported_duration")
+```
+
+## Final cleaning
+
+Get rid of extraneous columns, put things into a nice order, etc.
+
+```{r clean}
+dplyr::glimpse(data_ufo_reports_durations)
+
+data_ufo_reports_clean <- data_ufo_reports_durations |> 
+  dplyr::mutate(
+    state = dplyr::coalesce(state, ascii_state),
+    # Recode "images" to TRUE/FALSE, and replace NAs while we're at it.
+    has_images = isTRUE(images == "Yes"),
+    country = factor(country),
+    country_code = factor(country_code),
+    timezone = factor(timezone),
+    population = as.integer(population),
+    elevation = as.integer(elevation)
+  ) |> 
+  dplyr::select(
+    reported_date_time,
+    reported_date_time_utc,
+    posted_date,
+    city,
+    alternate_city_names,
+    state,
+    country,
+    country_code,
+    shape,
+    reported_duration,
+    duration_seconds,
+    summary,
+    has_images,
+    latitude,
+    longitude,
+    timezone,
+    population,
+    elevation_m = "elevation"
+  )
+```
+
+```{r save, eval = FALSE}
+saveRDS(data_ufo_reports_clean, here::here("data", "data_ufo_reports_clean.rds"))
+```

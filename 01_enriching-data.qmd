@@ -1,0 +1,38 @@
+---
+execute:
+  eval: false
+  echo: true
+format:
+  revealjs: 
+    theme: [dark, custom.scss]
+    logo: images/beekeeper_logo.svg
+    footer: r4ds.io/ghana202306 | Jon Harmon | @jonthegeek
+    multiplex: true
+    link-external-newwindow: true
+    transition: slide
+---
+
+# <img src="images/beekeeper_logo.svg" alt="The logo for the R package beekeeper. The logo is a yellow honeycomb with 4 bees facing the word &apos;beekeeper&apos;, all inside a darker-yellow hexagon." style="float: left; padding-right: 20px" width="400"/> Working with Web APIs in R:
+
+[Enriching Data]{style="font-size: 1.5em"}
+
+::: notes
+-   Introduce myself
+-   Introduce R4DS
+-   @jonthegeek
+-   Slides at r4ds.io/ghana202305
+-   <CLEVER LINE TO INTRODUCE THE TALK>
+:::
+
+# What is a web API?
+
+# What are some ways I might interact with APIs from R?
+
+# Case Study: Using an API to Enrich a Dataset
+
+-   Without enrichment: best roc_auc == 0.625
+-   Manually add "day" vs "night" where day = 6am to 6pm: best roc_auc = 0.624
+-   Fancy
+    -   Timezones: https://github.com/evansiroky/timezone-boundary-builder
+
+# How can I find suitable APIs?

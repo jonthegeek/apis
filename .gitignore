@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Ignore renders.
+*.html
+/rladies-rome_20230517_files/
+
+/.quarto/
