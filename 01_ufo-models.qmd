@@ -1,0 +1,169 @@
+---
+title: "UFO Shape Prediction"
+format: html
+---
+
+## Models!
+
+Now we'll finally compare a few models.
+I hope my fancy one wins!
+
+We'll use the same data (including splits) for all models.
+
+```{r data}
+data_ufo_reports <- readRDS(here::here("data", "data_ufo_reports_with_day_part.rds"))
+
+# Let's simplify this to the fields we'll eventually use, including some super
+# simple feature engineering.
+data_ufo_reports <- data_ufo_reports |> 
+  dplyr::select(
+    reported_date_time, reported_date_time_utc,
+    country_code,
+    shape,
+    duration_seconds,
+    has_images,
+    latitude,
+    longitude,
+    population,
+    elevation_m,
+    day_part
+  ) |> 
+  dplyr::mutate(
+    year = lubridate::year(reported_date_time_utc),
+    month = lubridate::month(reported_date_time_utc),
+    hour_local = lubridate::hour(reported_date_time),
+    # Simplify the shapes a bit
+    shape = tolower(shape) |> 
+      dplyr::case_match(
+        c("circle", "disk", "egg", "oval", "sphere") ~ "round",
+        c("delta", "chevron", "cone", "pyramid", "teardrop") ~ "triangle",
+        c("flare", "flash", "fireball") ~ "light",
+        c("cylinder", "cigar", "diamond") ~ "rectangle",
+        "formation" ~ "formation",
+        .default = "other"
+      )
+  )
+
+set.seed(70631)
+# We don't need ALL of this data for the model, particularly since it's a proof
+# of concept.
+ufo_split <- initial_split(data_ufo_reports, strata = shape, prop = 0.25)
+ufo_train <- training(ufo_split)
+ufo_test <- testing(ufo_split)
+ufo_folds <- vfold_cv(ufo_train, strata = shape, v = 5)
+```
+
+```{r model1}
+library(tidymodels)
+ranger_recipe <- data_ufo_reports |> 
+  recipe(formula = shape ~ year + month + hour_local + duration_seconds + 
+           latitude + longitude + country_code) |> 
+  recipes::step_other(country_code)
+
+ranger_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger") 
+
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% 
+  add_model(ranger_spec) 
+
+set.seed(4242)
+
+all_cores <- parallel::detectCores(logical = FALSE)
+
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+tictoc::tic()
+ranger_tune <-
+  tune_grid(
+    ranger_workflow, resamples = ufo_folds, grid = 10
+  )
+tictoc::toc()
+stopCluster(cl)
+
+ranger_tune |> 
+  show_best("roc_auc")
+```
+
+Try adding day/night manually and see if that helps.
+
+```{r model2}
+library(tidymodels)
+ranger_recipe_daynight <- data_ufo_reports |> 
+  recipe(formula = shape ~ year + month + hour_local + duration_seconds + 
+           latitude + longitude + country_code) |> 
+  recipes::step_other(country_code) |> 
+  recipes::step_mutate(
+    part_of_day = dplyr::case_when(
+      hour_local > 6 & hour_local < 18 ~ "day",
+      .default = "night"
+    ) |> factor()
+  )
+
+ranger_workflow_daynight <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_daynight) %>% 
+  add_model(ranger_spec) 
+
+set.seed(4242)
+
+all_cores <- parallel::detectCores(logical = FALSE)
+
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+tictoc::tic()
+ranger_tune_daynight <-
+  tune_grid(
+    ranger_workflow_daynight, resamples = ufo_folds, grid = 10
+  )
+tictoc::toc()
+stopCluster(cl)
+
+ranger_tune_daynight |> 
+  show_best("roc_auc")
+```
+
+Finaly, see if the fancy day periods help.
+
+```{r model3}
+library(tidymodels)
+ranger_recipe_daypart <- data_ufo_reports |> 
+  recipe(formula = shape ~ year + month + hour_local + duration_seconds + 
+           latitude + longitude + country_code + day_part) |> 
+  recipes::step_other(country_code)
+
+ranger_workflow_daypart <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe_daypart) %>% 
+  add_model(ranger_spec) 
+
+set.seed(4242)
+
+all_cores <- parallel::detectCores(logical = FALSE)
+
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+tictoc::tic()
+ranger_tune_daypart <-
+  tune_grid(
+    ranger_workflow_daypart, resamples = ufo_folds, grid = 10
+  )
+tictoc::toc()
+stopCluster(cl)
+
+ranger_tune_daypart |> 
+  show_best("roc_auc")
+```
+
+```{r run-all}
+# Just creating this to run everything above here, cuz I can't remember the hotkey.
+```

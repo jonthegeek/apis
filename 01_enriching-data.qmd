@@ -20,9 +20,11 @@ format:
 -   Introduce myself
 -   Introduce R4DS
 -   @jonthegeek
--   Slides at r4ds.io/ghana202305
--   <CLEVER LINE TO INTRODUCE THE TALK>
+-   Slides at r4ds.io/ghana202306
+-   How you can use the web to make your datasets better.
 :::
+
+# What is TidyTuesday?
 
 # What is a web API?
 

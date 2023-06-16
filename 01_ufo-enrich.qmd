@@ -1,9 +1,9 @@
 ---
-title: "UFO Models"
+title: "UFO Time of Day"
 format: html
 ---
 
-## Sunrise and sunset
+## Test the API
 
 ```{r packages}
 library(here)
@@ -14,4 +14,357 @@ library(httr2)
 data_ufo_reports_clean <- readRDS(
   here::here("data", "data_ufo_reports_clean.rds")
 )
+```
+
+We'll use the [sunrise-sunset.org API](https://sunrise-sunset.org/api) to add information about sunrise, sunset, etc to each dataset.
+First we'll run some tests to make sure this is viable.
+
+-   Does the API freak out with 100 calls? 1000?
+-   How much does rounding latitude/longitude impact the result?
+
+```{r api-tests}
+#| eval: false
+
+# https://api.sunrise-sunset.org/json?lat=36.7201600&lng=-4.4203400&date=2023-06-10
+data_ufo_reports_clean |> 
+  head(1) |> 
+  dplyr::glimpse()
+
+# Start with a "manual" query to see what the return looks like.
+response <- httr2::request("https://api.sunrise-sunset.org/json") |> 
+  httr2::req_url_query(
+    lat = "35.19543",
+    lng = "-79.46948",
+    date = "2022-08-29"
+  ) |> 
+  httr2::req_user_agent("api demo for Ghana R Users Community") |>
+  # httr2::req_dry_run()
+  httr2::req_perform() |> 
+  httr2::resp_body_json()
+
+names(response)
+
+response$results
+
+# Turn it into a function.
+fetch_day_parts <- function(latitude, longitude, date) {
+  # Grab the actual date, in case it's a datetime.
+  date <- lubridate::date(date)
+  
+  # Do the call.
+  response <- httr2::request("https://api.sunrise-sunset.org/json") |> 
+    httr2::req_url_query(
+      lat = latitude,
+      lng = longitude,
+      date = date,
+      formatted = 0
+    ) |> 
+    httr2::req_user_agent("api demo for Ghana R Users Community") |>
+    httr2::req_perform()
+  
+  result <- response |> 
+    httr2::resp_body_json()
+  
+  if (result$status == "OK") {
+    return(result$results)
+  }
+  cli::cli_abort(result$status)
+}
+
+# Try 1 calls
+test_results_1 <- data_ufo_reports_clean |> 
+  head(1) |> 
+  purrr::pmap(
+    \(latitude, longitude, reported_date_time_utc, ...) {
+      fetch_day_parts(latitude, longitude, reported_date_time_utc)
+    }
+  )
+
+# Try 10 calls!
+test_results_10 <- data_ufo_reports_clean |> 
+  head(10) |> 
+  purrr::pmap(
+    \(latitude, longitude, reported_date_time_utc, ...) {
+      fetch_day_parts(latitude, longitude, reported_date_time_utc)
+    }
+  )
+
+# Try 100 calls (and time it)!
+tictoc::tic()
+test_results_100 <- data_ufo_reports_clean |> 
+  head(100) |> 
+  purrr::pmap(
+    \(latitude, longitude, reported_date_time_utc, ...) {
+      fetch_day_parts(latitude, longitude, reported_date_time_utc)
+    }
+  ) |> 
+  tibble::enframe(name = NULL) |> 
+  tidyr::unnest_wider(value)
+tictoc::toc()
+```
+
+It takes about 21 seconds to make 100 calls to the API (actually 20.53s, consistent over 2 attempts at the same call).
+If we made 1 call per row of our dataset, that would take a little over 5 hours.
+
+Let's see if we can take that down by grouping into close-enough batches.
+How much can we round latitude/longitude without it changing significantly?
+
+```{r more-api-tests}
+#| eval: false
+
+# By default, they each have 5 decimal places. Let's round to 0-5 decimal places
+# and see what happens. In fact, let's see what the 10s digit gets us, too!
+test_results_rounding <- data_ufo_reports_clean |> 
+  head(1) |> 
+  dplyr::select(reported_date_time_utc, latitude, longitude) |> 
+  dplyr::mutate(
+    latitude = list(purrr::map(
+      -1:5,
+      ~ round(latitude, .x)
+    )),
+    longitude = list(purrr::map(
+      -1:5,
+      ~ round(longitude, .x)
+    ))
+  ) |> 
+  tidyr::unnest_longer(col = c(latitude, longitude)) |> 
+  purrr::pmap(
+    \(latitude, longitude, reported_date_time_utc) {
+      fetch_day_parts(latitude, longitude, reported_date_time_utc)
+    }
+  ) |> 
+  tibble::enframe(name = NULL) |> 
+  tidyr::unnest_wider(value)
+
+# At least in this sample, more than 2 decimal places had almost no impact. If
+# we round all latitude and longitude to 2 decimal places, can we reduce our
+# dataset size? How about with 0 or 1, which had very little impact?
+n_original <- nrow(data_ufo_reports_clean) # 96429
+
+distinct_place_dates <- data_ufo_reports_clean |> 
+  dplyr::mutate(reported_date = lubridate::date(reported_date_time_utc)) |> 
+  dplyr::distinct(latitude, longitude, reported_date)
+
+n_distinct <- nrow(distinct_place_dates) # 93243
+
+distinct_place_dates_2 <- distinct_place_dates |> 
+  dplyr::mutate(
+    latitude = round(latitude, 2),
+    longitude = round(longitude, 2)
+  ) |> 
+  dplyr::distinct(latitude, longitude, reported_date)
+
+n_distinct_2 <- nrow(distinct_place_dates_2) # 93243
+
+distinct_place_dates_0 <- distinct_place_dates |> 
+  dplyr::mutate(
+    latitude = round(latitude, 0),
+    longitude = round(longitude, 0)
+  ) |> 
+  dplyr::distinct(latitude, longitude, reported_date)
+
+n_distinct_0 <- nrow(distinct_place_dates_0) # 88466
+
+distinct_place_dates_tens <- distinct_place_dates |> 
+  dplyr::mutate(
+    latitude = round(latitude, -1),
+    longitude = round(longitude, -1)
+  ) |> 
+  dplyr::distinct(latitude, longitude, reported_date)
+
+n_distinct_tens <- nrow(distinct_place_dates_tens) # 59990
+
+# We actually need 3-day windows for each day, though, gah! Let's see how much
+# that changes. We'll use a sample of 100 random place-dates to test.
+extract_time <- function(datetime) {
+  return(
+    hms::hms(
+      lubridate::second(datetime),
+      lubridate::minute(datetime),
+      lubridate::hour(datetime)
+    )
+  )
+}
+
+date_effects <- distinct_place_dates |> 
+  dplyr::sample_n(100) |>
+  dplyr::mutate(
+    reported_date = purrr::map(
+      reported_date,
+      ~ .x + -1:1
+    )
+  ) |>
+  tidyr::unnest_longer(reported_date) |>
+  dplyr::distinct() |>
+  dplyr::mutate(
+    day_parts = purrr::pmap(
+      list(latitude, longitude, reported_date),
+      fetch_day_parts
+    )
+  ) |> 
+  tidyr::unnest_wider(day_parts) |> 
+  dplyr::select(
+    latitude:reported_date, 
+    day_length, 
+    sunrise:astronomical_twilight_end
+  ) |> 
+  dplyr::mutate(
+    dplyr::across(
+      sunrise:astronomical_twilight_end,
+      ~ lubridate::ymd_hms(.x)
+    )
+  ) |> 
+  dplyr::mutate(
+    sunrise_change = extract_time(sunrise) - extract_time(dplyr::lag(sunrise)),
+    .by = c(latitude, longitude),
+    .keep = "none"
+  ) |> 
+  dplyr::summarize(
+    mean_change = mean(abs(sunrise_change), na.rm = TRUE)
+  )
+
+# Sunrise changes by about a minute a day. The times are self-reported, so that small differeence is not enough to matter. Just fetch the data for the day of the report, and we'll use it to build a good-enough timeline.
+
+# In fact, let's see if rounding to the nearest week does anything to our
+# dataset.
+distinct_rounded_place_dates <- distinct_place_dates_tens |> 
+  dplyr::mutate(
+    rounded_date = lubridate::round_date(reported_date, unit = "week")
+  ) |> 
+  dplyr::distinct(latitude, longitude, rounded_date)
+```
+
+With all the rounding, we can get down to 26k rows, or about 1.5 hours of calls.
+I hope they don't get mad!
+
+With all this information, let's try to get all of the useful day parts!
+
+```{r do-api-call}
+#| eval: false
+day_parts_map_raw <- distinct_rounded_place_dates |> 
+  dplyr::mutate(
+    day_parts = purrr::pmap(
+      list(latitude, longitude, rounded_date),
+      fetch_day_parts,
+      .progress = TRUE
+    )
+  )
+
+saveRDS(day_parts_map_raw, here::here("data", "data_day_parts_map_raw.rds"))
+```
+
+```{r clean-api-result}
+day_parts_map_raw <- readRDS(here::here("data", "data_day_parts_map_raw.rds"))
+
+day_parts_map <- day_parts_map_raw |> 
+  tidyr::unnest_wider(day_parts) |> 
+  dplyr::select(
+    rounded_lat = latitude,
+    rounded_long = longitude,
+    rounded_date,
+    day_length,
+    sunrise:astronomical_twilight_end
+  ) |> 
+  dplyr::mutate(
+    dplyr::across(
+      sunrise:astronomical_twilight_end,
+      ~ dplyr::na_if(.x, "1970-01-01T00:00:01+00:00") |> 
+        dplyr::na_if("1970-01-01T00:00:00+00:00") |> 
+        lubridate::ymd_hms() |> 
+        # We only want the times; the date doesn't make sense at this point.
+        extract_time()
+    ) 
+  ) |> 
+  dplyr::select(
+    dplyr::starts_with("rounded"),
+    astronomical_twilight_begin,
+    nautical_twilight_begin,
+    civil_twilight_begin,
+    sunrise,
+    solar_noon,
+    sunset,
+    civil_twilight_end,
+    nautical_twilight_end,
+    astronomical_twilight_end
+  )
+
+# The return from the API always works out to start where astronomical twilight
+# begins (night --> dawn), and end where astronomical twilight ends (dusk -->
+# night). 
+
+choose_day_part <- function(time_utc, 
+                            astronomical_twilight_begin,
+                            nautical_twilight_begin,
+                            civil_twilight_begin,
+                            sunrise,
+                            solar_noon,
+                            sunset,
+                            civil_twilight_end,
+                            nautical_twilight_end,
+                            astronomical_twilight_end) {
+  times <- c(
+    astronomical_twilight_begin,
+    nautical_twilight_begin,
+    civil_twilight_begin,
+    sunrise,
+    solar_noon,
+    sunset,
+    civil_twilight_end,
+    nautical_twilight_end,
+    astronomical_twilight_end
+  ) |> 
+    rlang::set_names(
+      c(
+        "night",
+        "astronomical dawn",
+        "nautical dawn",
+        "civil dawn",
+        "morning",
+        "afternoon",
+        "civil dusk",
+        "nautical dusk",
+        "astronomical dusk"
+      )
+    )
+  
+  if (any(is.na(times))) {
+    return(NA_character_)
+  }
+  if (all(times < time_utc)) {
+    return(names(sort(times)[1]))
+  }
+  return(names(sort(times[times > time_utc])[1]))
+}
+
+data_ufo_reports_with_day_part <- data_ufo_reports_clean |> 
+  dplyr::mutate(
+    rounded_lat = round(latitude, -1),
+    rounded_long = round(longitude, -1),
+    rounded_date = lubridate::round_date(reported_date_time_utc, unit = "week")
+  ) |> 
+  dplyr::left_join(
+    day_parts_map, by = dplyr::join_by(rounded_lat, rounded_long, rounded_date)
+  ) |>
+  dplyr::mutate(
+    day_part = purrr::pmap_chr(
+      list(
+        extract_time(reported_date_time_utc),
+        astronomical_twilight_begin,
+        nautical_twilight_begin,
+        civil_twilight_begin,
+        sunrise,
+        solar_noon,
+        sunset,
+        civil_twilight_end,
+        nautical_twilight_end,
+        astronomical_twilight_end
+      ),
+      choose_day_part
+    )
+  ) |> 
+  dplyr::select(
+    -dplyr::starts_with("rounded_")
+  )
+
+saveRDS(data_ufo_reports_with_day_part, here::here("data", "data_ufo_reports_with_day_part.rds"))
 ```
