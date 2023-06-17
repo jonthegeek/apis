@@ -1,0 +1,4 @@
+- source: 01_enriching-data.qmd
+  quarto-pub:
+    - id: d2ef914e-898a-4c71-8cb6-b735f73f3da3
+      url: 'https://r4ds.quarto.pub/apis_01_intro-enrich'
