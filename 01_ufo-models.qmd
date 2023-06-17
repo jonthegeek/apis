@@ -10,6 +10,14 @@ I hope my fancy one wins!
 
 We'll use the same data (including splits) for all models.
 
+```{r libraries}
+library(tidymodels)
+library(doParallel)
+library(here)
+library(dplyr)
+library(tictoc)
+```
+
 ```{r data}
 data_ufo_reports <- readRDS(here::here("data", "data_ufo_reports_with_day_part.rds"))
 
@@ -54,11 +62,10 @@ ufo_folds <- vfold_cv(ufo_train, strata = shape, v = 5)
 ```
 
 ```{r model1}
-library(tidymodels)
 ranger_recipe <- data_ufo_reports |> 
   recipe(formula = shape ~ year + month + hour_local + duration_seconds + 
            latitude + longitude + country_code) |> 
-  recipes::step_other(country_code)
+  step_other(country_code)
 
 ranger_spec <- 
   rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
@@ -74,7 +81,6 @@ set.seed(4242)
 
 all_cores <- parallel::detectCores(logical = FALSE)
 
-library(doParallel)
 cl <- makePSOCKcluster(all_cores)
 registerDoParallel(cl)
 
@@ -93,12 +99,11 @@ ranger_tune |>
 Try adding day/night manually and see if that helps.
 
 ```{r model2}
-library(tidymodels)
 ranger_recipe_daynight <- data_ufo_reports |> 
   recipe(formula = shape ~ year + month + hour_local + duration_seconds + 
            latitude + longitude + country_code) |> 
-  recipes::step_other(country_code) |> 
-  recipes::step_mutate(
+  step_other(country_code) |> 
+  step_mutate(
     part_of_day = dplyr::case_when(
       hour_local > 6 & hour_local < 18 ~ "day",
       .default = "night"
@@ -110,11 +115,8 @@ ranger_workflow_daynight <-
   add_recipe(ranger_recipe_daynight) %>% 
   add_model(ranger_spec) 
 
-set.seed(4242)
-
 all_cores <- parallel::detectCores(logical = FALSE)
 
-library(doParallel)
 cl <- makePSOCKcluster(all_cores)
 registerDoParallel(cl)
 
@@ -133,11 +135,11 @@ ranger_tune_daynight |>
 Finaly, see if the fancy day periods help.
 
 ```{r model3}
-library(tidymodels)
 ranger_recipe_daypart <- data_ufo_reports |> 
   recipe(formula = shape ~ year + month + hour_local + duration_seconds + 
            latitude + longitude + country_code + day_part) |> 
-  recipes::step_other(country_code)
+  step_other(country_code) |> 
+  step_impute_mode(day_part)
 
 ranger_workflow_daypart <- 
   workflow() %>% 
@@ -146,9 +148,6 @@ ranger_workflow_daypart <-
 
 set.seed(4242)
 
-all_cores <- parallel::detectCores(logical = FALSE)
-
-library(doParallel)
 cl <- makePSOCKcluster(all_cores)
 registerDoParallel(cl)
 
