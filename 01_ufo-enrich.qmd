@@ -288,6 +288,9 @@ day_parts_map <- day_parts_map_raw |>
     astronomical_twilight_end
   )
 
+# saveRDS(day_parts_map, here::here("data", "data_day_parts_map.rds"))
+# day_parts_map <- readRDS(here::here("data", "data_day_parts_map.rds"))
+
 # The return from the API always works out to start where astronomical twilight
 # begins (night --> dawn), and end where astronomical twilight ends (dusk -->
 # night). 
